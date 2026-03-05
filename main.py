@@ -3,6 +3,16 @@ import pandas as pd
 from datetime import date, datetime, timedelta
 from supabase import create_client, Client
 
+def get_db():
+    """
+    Returns a PostgREST client that is authenticated with the logged-in user's access token.
+    This is REQUIRED for Supabase Row Level Security (RLS) to allow inserts/updates.
+    """
+    token = st.session_state.get("access_token")
+    if not token:
+        return None
+    return supabase.postgrest.auth(token)
+
 # -----------------------------
 # Config
 # -----------------------------
@@ -370,3 +380,4 @@ else:
             st.rerun()
         except Exception as e:
             st.error(f"Delete failed: {e}")
+
