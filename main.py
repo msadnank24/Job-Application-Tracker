@@ -4,25 +4,20 @@ import pandas as pd
 import streamlit as st
 from supabase import create_client
 
-
 # -----------------------------
-# CONFIG
+# PAGE CONFIG
 # -----------------------------
 st.set_page_config(page_title="Job Application Tracker", layout="wide")
 
-NO_UPDATE_DAYS_THRESHOLD = 21  # >= 21 days -> Orange (only if "No Update Yet")
+NO_UPDATE_DAYS_THRESHOLD = 21  # >=21 days (Applied + No Update Yet) -> Orange
 
 VISA_OPTIONS = ["Yes", "No"]
 
-STATUS_OPTIONS = [
-    "Applied",
-    "In Process",
-    "Rejected",
-]
+STATUS_OPTIONS = ["Applied", "In Process", "Rejected"]
 
 LAST_UPDATE_OPTIONS = [
-    "Submitted",
     "No Update Yet",
+    "Submitted",
     "Assessment Sent",
     "Phone Screen Scheduled",
     "Interview Scheduled",
@@ -31,7 +26,8 @@ LAST_UPDATE_OPTIONS = [
     "Rejected",
 ]
 
-IN_PROGRESS_UPDATES = {
+# Anything here = GREEN
+PROGRESS_UPDATES = {
     "Assessment Sent",
     "Phone Screen Scheduled",
     "Interview Scheduled",
@@ -41,10 +37,9 @@ IN_PROGRESS_UPDATES = {
 
 
 # -----------------------------
-# SUPABASE CLIENT
+# SUPABASE
 # -----------------------------
 def get_supabase_client():
-    # Prefer Streamlit Cloud secrets, fallback to env vars
     url = st.secrets.get("SUPABASE_URL", os.getenv("SUPABASE_URL", ""))
     key = st.secrets.get("SUPABASE_ANON_KEY", os.getenv("SUPABASE_ANON_KEY", ""))
 
@@ -56,7 +51,7 @@ def get_supabase_client():
 
 
 def apply_auth_token(sb, access_token: str | None):
-    # Critical for RLS: PostgREST must receive the JWT
+    # IMPORTANT for RLS
     if access_token:
         sb.postgrest.auth(access_token)
     return sb
@@ -82,53 +77,62 @@ def safe_date(value):
 
 
 def compute_color_group(status: str, last_update: str, d_applied: date | None) -> str:
+    """
+    EXACT RULES YOU WANTED:
+    - Red: rejected (status or last_update)
+    - Green: any positive/progress update OR status In Process
+    - Yellow: Applied / early stage
+    - Orange: Applied + No Update Yet for >= 21 days
+    """
     status = (status or "").strip()
     last_update = (last_update or "").strip()
 
-    # 1) Red overrides everything
+    # RED
     if status == "Rejected" or last_update == "Rejected":
         return "Red"
 
-    # 2) Green = active progress
-    if status == "In Process" or last_update in IN_PROGRESS_UPDATES:
+    # GREEN
+    if status == "In Process" or last_update in PROGRESS_UPDATES:
         return "Green"
 
-    # 3) Orange/Yellow ONLY based on No Update Yet + age
+    # ORANGE / YELLOW (Applied / early stage)
+    # Orange ONLY when still no updates (No Update Yet) and old enough
     if last_update == "No Update Yet" and d_applied:
-        days_open = (date.today() - d_applied).days
-        if days_open >= NO_UPDATE_DAYS_THRESHOLD:
+        age_days = (date.today() - d_applied).days
+        if age_days >= NO_UPDATE_DAYS_THRESHOLD:
             return "Orange"
         return "Yellow"
 
-    # 4) Default ongoing
+    # Submitted is still early stage -> Yellow (even if old)
     return "Yellow"
 
 
 def group_rank(group: str) -> int:
-    # Auto sort order: Green -> Yellow -> Orange -> Red
-    mapping = {"Green": 0, "Yellow": 1, "Orange": 2, "Red": 3}
-    return mapping.get(group, 9)
+    # Auto sort: Green -> Yellow -> Orange -> Red
+    return {"Green": 0, "Yellow": 1, "Orange": 2, "Red": 3}.get(group, 9)
 
 
 def style_rows(df_display: pd.DataFrame, groups: pd.Series):
-    # Row coloring (no visible "Color Group" column)
+    """
+    Stronger colors (not transparent) so Yellow/Orange don't look brown/dirty.
+    Also make text BLACK on Yellow/Orange for readability.
+    """
     def row_style(i):
         g = groups.iloc[i]
         if g == "Green":
-            return ["background-color: rgba(46, 204, 113, 0.35); color: white;"] * len(df_display.columns)
+            return ["background-color:#1f9d55; color:white;"] * len(df_display.columns)
         if g == "Yellow":
-            return ["background-color: rgba(241, 196, 15, 0.35); color: white;"] * len(df_display.columns)
+            return ["background-color:#f1c40f; color:black;"] * len(df_display.columns)
         if g == "Orange":
-            # slightly darker so text readable
-            return ["background-color: rgba(230, 126, 34, 0.38); color: white;"] * len(df_display.columns)
+            return ["background-color:#e67e22; color:black;"] * len(df_display.columns)
         if g == "Red":
-            return ["background-color: rgba(231, 76, 60, 0.42); color: white;"] * len(df_display.columns)
+            return ["background-color:#e74c3c; color:white;"] * len(df_display.columns)
         return [""] * len(df_display.columns)
 
     styled = df_display.style.apply(lambda _row: row_style(_row.name), axis=1)
     styled = styled.set_table_styles(
         [
-            {"selector": "th", "props": [("background-color", "rgba(255,255,255,0.04)"), ("color", "white")]},
+            {"selector": "th", "props": [("background-color", "rgba(255,255,255,0.06)"), ("color", "white")]},
             {"selector": "td", "props": [("border-color", "rgba(255,255,255,0.08)")]},
         ]
     )
@@ -144,13 +148,9 @@ def fetch_jobs(sb, access_token: str, user_id: str) -> pd.DataFrame:
     if df.empty:
         return df
 
-    # Normalize types
     df["date_applied"] = df["date_applied"].apply(safe_date)
-    df["company"] = df["company"].astype(str)
-    df["position"] = df["position"].astype(str)
-    df["visa"] = df["visa"].astype(str)
-    df["status"] = df["status"].astype(str)
-    df["last_update"] = df["last_update"].astype(str)
+    for c in ["company", "position", "visa", "status", "last_update"]:
+        df[c] = df[c].astype(str)
 
     return df
 
@@ -217,7 +217,6 @@ def auth_panel(sb):
         if st.button("Create account"):
             try:
                 res = sb.auth.sign_up({"email": email, "password": password})
-                # If email confirmation is ON, session may be None
                 if res.session:
                     st.session_state.session = res.session
                     st.session_state.user = res.user
@@ -237,11 +236,9 @@ def auth_panel(sb):
 def main():
     sb = get_supabase_client()
 
-    authed = auth_panel(sb)
-    if not authed:
+    if not auth_panel(sb):
         st.stop()
 
-    # session/user guaranteed now
     session = st.session_state.session
     user = st.session_state.user
     access_token = session.access_token
@@ -262,7 +259,7 @@ def main():
             status = st.selectbox("Status", STATUS_OPTIONS, index=0)
         with c3:
             date_applied = st.date_input("Date Applied", value=date.today())
-            last_update = st.selectbox("Last Update", LAST_UPDATE_OPTIONS, index=LAST_UPDATE_OPTIONS.index("Submitted"))
+            last_update = st.selectbox("Last Update", LAST_UPDATE_OPTIONS, index=LAST_UPDATE_OPTIONS.index("No Update Yet"))
 
         if st.button("Save Job"):
             if not company.strip() or not position.strip():
@@ -285,15 +282,13 @@ def main():
                     st.error(f"Failed to save: {e}")
 
     # -----------------------------
-    # FETCH + COMPUTE GROUPS
+    # FETCH + GROUPS
     # -----------------------------
     df = fetch_jobs(sb, access_token, user_id)
-
     if df.empty:
         st.info("No jobs yet. Add your first one above.")
         st.stop()
 
-    # Compute groups (kept separately — NOT shown as a column)
     groups = df.apply(
         lambda r: compute_color_group(
             status=str(r.get("status", "")),
@@ -312,16 +307,12 @@ def main():
 
     with f1:
         q = st.text_input("Search (company / position / status / last update)", "").strip().lower()
-
     with f2:
         status_filter = st.selectbox("Status Filter", ["All"] + STATUS_OPTIONS, index=0)
-
     with f3:
         visa_filter = st.selectbox("Visa Filter", ["All"] + VISA_OPTIONS, index=0)
-
     with f4:
         color_filter = st.selectbox("Color Group", ["All", "Green", "Yellow", "Orange", "Red"], index=0)
-
     with f5:
         sort_mode = st.selectbox(
             "Sort",
@@ -335,13 +326,12 @@ def main():
             index=0,
         )
 
-    # Build a working dataframe copy
     work = df.copy()
     work["_group"] = groups.values
     work["_group_rank"] = work["_group"].apply(group_rank)
     work["_date_sort"] = work["date_applied"].apply(lambda d: d if isinstance(d, date) else date.min)
 
-    # Apply search
+    # Search
     if q:
         mask = (
             work["company"].str.lower().str.contains(q, na=False)
@@ -351,19 +341,16 @@ def main():
         )
         work = work[mask]
 
-    # Apply filters
+    # Filters
     if status_filter != "All":
         work = work[work["status"] == status_filter]
-
     if visa_filter != "All":
         work = work[work["visa"] == visa_filter]
-
     if color_filter != "All":
         work = work[work["_group"] == color_filter]
 
-    # Apply sort
+    # Sort
     if sort_mode == "Auto (best)":
-        # Green -> Yellow -> Orange -> Red, then newest date_applied first
         work = work.sort_values(by=["_group_rank", "_date_sort"], ascending=[True, False])
     elif sort_mode == "Date Applied (newest first)":
         work = work.sort_values(by=["_date_sort"], ascending=[False])
@@ -374,15 +361,22 @@ def main():
     elif sort_mode == "Company (Z→A)":
         work = work.sort_values(by=["company", "_date_sort"], ascending=[False, False])
 
-    # Rebuild Job # after sorting
     work = work.reset_index(drop=True)
     work["Job #"] = work.index + 1
 
-    # Display dataframe (hide internal cols)
-    display_cols = ["Job #", "date_applied", "company", "position", "visa", "status", "last_update"]
-    df_display = work[display_cols].copy()
+    # DISPLAY: friendly headers (no underscores)
+    df_display = work[["Job #", "date_applied", "company", "position", "visa", "status", "last_update"]].copy()
+    df_display = df_display.rename(
+        columns={
+            "date_applied": "Date Applied",
+            "company": "Company",
+            "position": "Position",
+            "visa": "Visa Sponsorship",
+            "status": "Status",
+            "last_update": "Last Update",
+        }
+    )
 
-    # Use the sorted group's series for styling
     sorted_groups = work["_group"].reset_index(drop=True)
 
     st.dataframe(
@@ -392,9 +386,8 @@ def main():
     )
 
     st.caption(
-        f"Rules: Red=Rejected | Green=In Process/assessment/interviews/offers | "
-        f"Orange=No Update Yet ≥ {NO_UPDATE_DAYS_THRESHOLD} days | Yellow=Other ongoing. "
-        f"Auto sort: Green → Yellow → Orange → Red, then newest date applied."
+        f"Rules: Red=Rejected | Green=Progress (assessment/interviews/offers) | "
+        f"Orange=Applied + No Update Yet ≥ {NO_UPDATE_DAYS_THRESHOLD} days | Yellow=Applied/early stage."
     )
 
     # -----------------------------
@@ -403,19 +396,13 @@ def main():
     st.markdown("---")
     st.subheader("Edit / Update an Existing Entry")
 
-    # Let user pick by Job # from CURRENT sorted view
     if work.empty:
-        st.info("No results match your current filters.")
+        st.info("No results match your filters.")
         st.stop()
 
-    pick_col1, pick_col2 = st.columns([2, 3])
-    with pick_col1:
-        pick_job_no = st.selectbox("Select Job #", work["Job #"].tolist(), index=0, key="pick_job_no")
+    pick_job_no = st.selectbox("Select Job #", work["Job #"].tolist(), index=0, key="pick_job_no")
     selected_row = work.loc[work["Job #"] == pick_job_no].iloc[0]
     selected_id = int(selected_row["id"])
-
-    with pick_col2:
-        st.caption(f"Editing: **{selected_row['company']}** — {selected_row['position']} (DB id: {selected_id})")
 
     ec1, ec2, ec3 = st.columns(3)
     with ec1:
@@ -453,7 +440,7 @@ def main():
     with b1:
         if st.button("Update Job", key=f"btn_update_{selected_id}"):
             payload = {
-                "user_id": user_id,  # ensure RLS passes (auth.uid() == user_id)
+                "user_id": user_id,  # keep RLS happy
                 "date_applied": new_date_applied.isoformat(),
                 "company": new_company.strip(),
                 "position": new_position.strip(),
