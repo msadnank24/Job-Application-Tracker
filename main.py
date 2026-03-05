@@ -346,14 +346,13 @@ if view_df.empty:
     st.info("No applications found yet (or filters removed everything).")
 else:
     show_df = view_df[table_cols].rename(columns={
-        "date_applied": "Date Applied",
-        "company": "Company",
-        "position": "Position",
-        "visa": "Visa Sponsorship",
-        "status": "Status",
-        "last_update": "Last Update",
-        "ColorGroup": "Color Group",
-    })
+    "date_applied": "Date Applied",
+    "company": "Company",
+    "position": "Position",
+    "visa": "Visa Sponsorship",
+    "status": "Status",
+    "last_update": "Last Update",
+})
     st.dataframe(style_table(show_df), use_container_width=True, height=420)
 
 
@@ -434,4 +433,5 @@ else:
             st.rerun()
         except Exception as e:
             st.error(f"Delete failed: {e}")
+
 
