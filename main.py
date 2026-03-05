@@ -286,11 +286,21 @@ df["status"] = df["status"].astype(str)
 df["last_update"] = df["last_update"].astype(str)
 
 # Compute color group (internal only)
-df["_color_group"] = df.apply(
-    lambda r: compute_color_group(r.get("status"), r.get("last_update"), r.get("date_applied")),
-    axis=1,
-)
+# --- SAFETY: remove internal columns if they already exist (or exist multiple times) ---
+internal_cols = {"_color_group", "_color_rank", "Job #"}
+df = df.loc[:, ~df.columns.isin(list(internal_cols))]
 
+# Also remove duplicated columns (this is the usual cause of your ValueError)
+df = df.loc[:, ~df.columns.duplicated()]
+
+# --- Compute color group safely (no .apply expansion issues) ---
+if df.empty:
+    df["_color_group"] = []
+else:
+    df["_color_group"] = [
+        compute_color_group(r.get("status"), r.get("last_update"), r.get("date_applied"))
+        for _, r in df.iterrows()
+    ]
 # Sort key
 df["_color_rank"] = df["_color_group"].map(COLOR_ORDER).fillna(9).astype(int)
 
@@ -498,3 +508,4 @@ else:
             st.rerun()
         except Exception as e:
             st.error(f"Delete failed: {e}")
+
