@@ -1,469 +1,496 @@
+# main.py
+# Job Application Tracker (Streamlit + Supabase)
+# Features:
+# - Email/password Signup + Login + Logout
+# - Per-user data isolation (works with Supabase RLS policies)
+# - Add / Edit / Delete jobs
+# - Dropdown for Status + Last Update (same options in add + edit)
+# - Color-coded rows (NO "Color Group" column shown)
+# - Rules:
+#     RED    = Rejected
+#     GREEN  = Positive progress (Interview/Assessment/In Process/Offer/etc.)
+#     ORANGE = Still "Applied" + no-progress last_update (Submitted/No Update Yet) AND >= 21 days since Date Applied
+#     YELLOW = Other ongoing / applied-recent
+# - Auto-sorting: Green -> Yellow -> Orange -> Red, then newest Date Applied first
+# - Search + Filters + Sort controls
+
 import os
 from datetime import date, datetime
 import pandas as pd
 import streamlit as st
+
 from supabase import create_client
 
-# -----------------------------
-# PAGE CONFIG
-# -----------------------------
-st.set_page_config(page_title="Job Application Tracker", layout="wide")
+# ---------------------------
+# Page setup
+# ---------------------------
+st.set_page_config(page_title="Job Application Tracker", page_icon="📌", layout="wide")
 
-NO_UPDATE_DAYS_THRESHOLD = 21  # >=21 days (Applied + No Update Yet) -> Orange
+# ---------------------------
+# Secrets / env
+# ---------------------------
+SUPABASE_URL = st.secrets.get("SUPABASE_URL") if hasattr(st, "secrets") else None
+SUPABASE_ANON_KEY = st.secrets.get("SUPABASE_ANON_KEY") if hasattr(st, "secrets") else None
 
+# allow local env fallback
+SUPABASE_URL = SUPABASE_URL or os.getenv("SUPABASE_URL")
+SUPABASE_ANON_KEY = SUPABASE_ANON_KEY or os.getenv("SUPABASE_ANON_KEY")
+
+if not SUPABASE_URL or not SUPABASE_ANON_KEY:
+    st.error(
+        "Missing Supabase credentials.\n\n"
+        "Add these in Streamlit Secrets:\n"
+        "SUPABASE_URL = \"https://xxxx.supabase.co\"\n"
+        "SUPABASE_ANON_KEY = \"your_publishable_key\"\n"
+    )
+    st.stop()
+
+supabase = create_client(SUPABASE_URL, SUPABASE_ANON_KEY)
+
+# ---------------------------
+# Options (edit these if you want)
+# ---------------------------
 VISA_OPTIONS = ["Yes", "No"]
 
-STATUS_OPTIONS = ["Applied", "In Process", "Rejected"]
+STATUS_OPTIONS = [
+    "Applied",
+    "In Process",
+    "Rejected",
+]
 
 LAST_UPDATE_OPTIONS = [
     "No Update Yet",
     "Submitted",
     "Assessment Sent",
+    "Assessment Completed",
     "Phone Screen Scheduled",
     "Interview Scheduled",
-    "Interview Completed",
-    "Offer Received",
+    "Interview Done",
+    "Offer",
+    "Hired",
     "Rejected",
 ]
 
-# Anything here = GREEN
-PROGRESS_UPDATES = {
+# What counts as "green progress"
+GREEN_UPDATES = {
+    "In Process",
     "Assessment Sent",
+    "Assessment Completed",
     "Phone Screen Scheduled",
     "Interview Scheduled",
-    "Interview Completed",
-    "Offer Received",
+    "Interview Done",
+    "Offer",
+    "Hired",
 }
 
+# What counts as "no real progress" (still applied stage)
+NO_PROGRESS_UPDATES = {
+    "No Update Yet",
+    "Submitted",
+}
 
-# -----------------------------
-# SUPABASE
-# -----------------------------
-def get_supabase_client():
-    url = st.secrets.get("SUPABASE_URL", os.getenv("SUPABASE_URL", ""))
-    key = st.secrets.get("SUPABASE_ANON_KEY", os.getenv("SUPABASE_ANON_KEY", ""))
+ORANGE_DAYS = 21
 
-    if not url or not key:
-        st.error("Missing SUPABASE_URL / SUPABASE_ANON_KEY in Streamlit Secrets.")
-        st.stop()
-
-    return create_client(url, key)
-
-
-def apply_auth_token(sb, access_token: str | None):
-    # IMPORTANT for RLS
-    if access_token:
-        sb.postgrest.auth(access_token)
-    return sb
-
-
-# -----------------------------
-# HELPERS
-# -----------------------------
-def safe_date(value):
-    if value is None or value == "":
+# ---------------------------
+# Helpers
+# ---------------------------
+def _safe_date(x):
+    """Return python date from date/datetime/iso-string, or None."""
+    if x is None or str(x).strip() == "":
         return None
-    if isinstance(value, date):
-        return value
-    if isinstance(value, datetime):
-        return value.date()
-    try:
-        return datetime.fromisoformat(str(value)).date()
-    except Exception:
+    if isinstance(x, date) and not isinstance(x, datetime):
+        return x
+    if isinstance(x, datetime):
+        return x.date()
+    if isinstance(x, str):
         try:
-            return datetime.strptime(str(value), "%Y-%m-%d").date()
+            return date.fromisoformat(x[:10])
         except Exception:
             return None
+    return None
 
 
-def compute_color_group(status: str, last_update: str, d_applied: date | None) -> str:
+def color_group(row) -> str:
     """
-    EXACT RULES YOU WANTED:
-    - Red: rejected (status or last_update)
-    - Green: any positive/progress update OR status In Process
-    - Yellow: Applied / early stage
-    - Orange: Applied + No Update Yet for >= 21 days
+    RED    = rejected
+    GREEN  = positive progress
+    ORANGE = Applied + no-progress update AND >= 21 days since applied
+    YELLOW = everything else ongoing
     """
-    status = (status or "").strip()
-    last_update = (last_update or "").strip()
+    status = str(row.get("status", "")).strip()
+    last_update = str(row.get("last_update", "")).strip()
+
+    # date difference
+    applied = _safe_date(row.get("date_applied"))
+    days_since = (date.today() - applied).days if applied else 0
 
     # RED
-    if status == "Rejected" or last_update == "Rejected":
-        return "Red"
+    if status.lower() == "rejected" or last_update.lower() == "rejected":
+        return "red"
 
     # GREEN
-    if status == "In Process" or last_update in PROGRESS_UPDATES:
-        return "Green"
+    if status in GREEN_UPDATES or last_update in GREEN_UPDATES:
+        return "green"
 
-    # ORANGE / YELLOW (Applied / early stage)
-    # Orange ONLY when still no updates (No Update Yet) and old enough
-    if last_update == "No Update Yet" and d_applied:
-        age_days = (date.today() - d_applied).days
-        if age_days >= NO_UPDATE_DAYS_THRESHOLD:
-            return "Orange"
-        return "Yellow"
+    # ORANGE (the exact rule you asked for)
+    if status == "Applied" and (last_update in NO_PROGRESS_UPDATES) and days_since >= ORANGE_DAYS:
+        return "orange"
 
-    # Submitted is still early stage -> Yellow (even if old)
-    return "Yellow"
+    # YELLOW (applied but recent OR other ongoing non-green)
+    return "yellow"
 
 
-def group_rank(group: str) -> int:
-    # Auto sort: Green -> Yellow -> Orange -> Red
-    return {"Green": 0, "Yellow": 1, "Orange": 2, "Red": 3}.get(group, 9)
+def group_rank(g: str) -> int:
+    # green first, then yellow, then orange, then red last
+    return {"green": 0, "yellow": 1, "orange": 2, "red": 3}.get(g, 9)
 
 
-def style_rows(df_display: pd.DataFrame, groups: pd.Series):
-    """
-    Stronger colors (not transparent) so Yellow/Orange don't look brown/dirty.
-    Also make text BLACK on Yellow/Orange for readability.
-    """
-    def row_style(i):
-        g = groups.iloc[i]
-        if g == "Green":
-            return ["background-color:#1f9d55; color:white;"] * len(df_display.columns)
-        if g == "Yellow":
-            return ["background-color:#f1c40f; color:black;"] * len(df_display.columns)
-        if g == "Orange":
-            return ["background-color:#e67e22; color:black;"] * len(df_display.columns)
-        if g == "Red":
-            return ["background-color:#e74c3c; color:white;"] * len(df_display.columns)
-        return [""] * len(df_display.columns)
-
-    styled = df_display.style.apply(lambda _row: row_style(_row.name), axis=1)
-    styled = styled.set_table_styles(
-        [
-            {"selector": "th", "props": [("background-color", "rgba(255,255,255,0.06)"), ("color", "white")]},
-            {"selector": "td", "props": [("border-color", "rgba(255,255,255,0.08)")]},
-        ]
-    )
-    return styled
+def row_bg_css(g: str) -> str:
+    # readable colors (no orange text readability issues)
+    if g == "green":
+        return "background-color: #23b26b; color: #ffffff;"
+    if g == "yellow":
+        return "background-color: #f2c94c; color: #111111;"
+    if g == "orange":
+        return "background-color: #f2994a; color: #111111;"
+    if g == "red":
+        return "background-color: #eb5757; color: #ffffff;"
+    return ""
 
 
-def fetch_jobs(sb, access_token: str, user_id: str) -> pd.DataFrame:
-    sb = apply_auth_token(sb, access_token)
-    resp = sb.table("jobs").select("*").eq("user_id", user_id).execute()
-    data = resp.data or []
-    df = pd.DataFrame(data)
+def style_rows(df: pd.DataFrame):
+    def _style(row):
+        g = row.get("_color_group", "")
+        return [row_bg_css(g)] * len(row)
 
-    if df.empty:
-        return df
-
-    df["date_applied"] = df["date_applied"].apply(safe_date)
-    for c in ["company", "position", "visa", "status", "last_update"]:
-        df[c] = df[c].astype(str)
-
-    return df
+    return df.style.apply(_style, axis=1)
 
 
-def do_insert_job(sb, access_token: str, payload: dict):
-    sb = apply_auth_token(sb, access_token)
-    return sb.table("jobs").insert(payload).execute()
+def get_user():
+    """Return current user object if logged in, else None."""
+    try:
+        # If we've stored a session, set it for client
+        if st.session_state.get("sb_access_token") and st.session_state.get("sb_refresh_token"):
+            supabase.auth.set_session(
+                st.session_state["sb_access_token"],
+                st.session_state["sb_refresh_token"],
+            )
+        res = supabase.auth.get_user()
+        return res.user if res else None
+    except Exception:
+        return None
 
 
-def do_update_job(sb, access_token: str, job_id: int, payload: dict):
-    sb = apply_auth_token(sb, access_token)
-    return sb.table("jobs").update(payload).eq("id", job_id).execute()
-
-
-def do_delete_job(sb, access_token: str, job_id: int):
-    sb = apply_auth_token(sb, access_token)
-    return sb.table("jobs").delete().eq("id", job_id).execute()
-
-
-# -----------------------------
-# AUTH UI
-# -----------------------------
-def auth_panel(sb):
+def require_login_ui():
     st.title("Job Application Tracker")
+    st.caption("Please log in or sign up to access your private dashboard.")
 
-    if "session" not in st.session_state:
-        st.session_state.session = None
-    if "user" not in st.session_state:
-        st.session_state.user = None
+    tab_login, tab_signup = st.tabs(["Login", "Sign up"])
 
-    if st.session_state.session and st.session_state.user:
-        col1, col2 = st.columns([1, 3])
-        with col1:
-            if st.button("Log out"):
-                try:
-                    sb.auth.sign_out()
-                except Exception:
-                    pass
-                st.session_state.session = None
-                st.session_state.user = None
-                st.rerun()
-        with col2:
-            st.caption(f"Signed in as: **{st.session_state.user.email}**")
-        return True
-
-    tab1, tab2 = st.tabs(["Login", "Sign up"])
-
-    with tab1:
+    with tab_login:
         email = st.text_input("Email", key="login_email")
-        password = st.text_input("Password", type="password", key="login_pass")
-        if st.button("Login"):
+        pw = st.text_input("Password", type="password", key="login_pw")
+        if st.button("Login", key="login_btn"):
             try:
-                res = sb.auth.sign_in_with_password({"email": email, "password": password})
-                st.session_state.session = res.session
-                st.session_state.user = res.user
+                resp = supabase.auth.sign_in_with_password({"email": email, "password": pw})
+                # store tokens for persistence in Streamlit session
+                st.session_state["sb_access_token"] = resp.session.access_token
+                st.session_state["sb_refresh_token"] = resp.session.refresh_token
                 st.success("Logged in.")
                 st.rerun()
             except Exception as e:
                 st.error(f"Login failed: {e}")
 
-    with tab2:
-        email = st.text_input("Email", key="signup_email")
-        password = st.text_input("Password", type="password", key="signup_pass")
-        if st.button("Create account"):
+    with tab_signup:
+        email2 = st.text_input("Email", key="su_email")
+        pw2 = st.text_input("Password", type="password", key="su_pw")
+        if st.button("Create account", key="signup_btn"):
             try:
-                res = sb.auth.sign_up({"email": email, "password": password})
-                if res.session:
-                    st.session_state.session = res.session
-                    st.session_state.user = res.user
-                    st.success("Account created & signed in.")
-                    st.rerun()
-                else:
-                    st.success("Account created. Check your email to confirm, then login.")
+                supabase.auth.sign_up({"email": email2, "password": pw2})
+                st.success("Account created. Now go to Login and sign in.")
             except Exception as e:
-                st.error(f"Signup failed: {e}")
+                st.error(f"Sign up failed: {e}")
 
-    return False
+    st.stop()
 
 
-# -----------------------------
-# MAIN APP
-# -----------------------------
-def main():
-    sb = get_supabase_client()
-
-    if not auth_panel(sb):
-        st.stop()
-
-    session = st.session_state.session
-    user = st.session_state.user
-    access_token = session.access_token
-    user_id = user.id
-
-    st.markdown("---")
-
-    # -----------------------------
-    # ADD NEW JOB
-    # -----------------------------
-    with st.expander("➕ Add New Application", expanded=True):
-        c1, c2, c3 = st.columns(3)
-        with c1:
-            company = st.text_input("Company Name", "")
-            visa = st.selectbox("Visa Sponsorship", VISA_OPTIONS, index=1 if "No" in VISA_OPTIONS else 0)
-        with c2:
-            position = st.text_input("Position", "")
-            status = st.selectbox("Status", STATUS_OPTIONS, index=0)
-        with c3:
-            date_applied = st.date_input("Date Applied", value=date.today())
-            last_update = st.selectbox("Last Update", LAST_UPDATE_OPTIONS, index=LAST_UPDATE_OPTIONS.index("No Update Yet"))
-
-        if st.button("Save Job"):
-            if not company.strip() or not position.strip():
-                st.warning("Company and Position are required.")
-            else:
-                payload = {
-                    "user_id": user_id,
-                    "date_applied": date_applied.isoformat(),
-                    "company": company.strip(),
-                    "position": position.strip(),
-                    "visa": visa,
-                    "status": status,
-                    "last_update": last_update,
-                }
-                try:
-                    do_insert_job(sb, access_token, payload)
-                    st.success("Saved.")
-                    st.rerun()
-                except Exception as e:
-                    st.error(f"Failed to save: {e}")
-
-    # -----------------------------
-    # FETCH + GROUPS
-    # -----------------------------
-    df = fetch_jobs(sb, access_token, user_id)
+def fetch_jobs(user_id: str) -> pd.DataFrame:
+    # RLS should ensure only user rows come back, but we filter anyway
+    resp = supabase.table("jobs").select("*").eq("user_id", user_id).execute()
+    rows = resp.data or []
+    df = pd.DataFrame(rows)
     if df.empty:
-        st.info("No jobs yet. Add your first one above.")
-        st.stop()
+        return pd.DataFrame(columns=["id", "date_applied", "company", "position", "visa", "status", "last_update"])
+    # normalize date
+    df["date_applied"] = df["date_applied"].apply(_safe_date)
+    return df
 
-    groups = df.apply(
-        lambda r: compute_color_group(
-            status=str(r.get("status", "")),
-            last_update=str(r.get("last_update", "")),
-            d_applied=safe_date(r.get("date_applied")),
-        ),
+
+def insert_job(user_id: str, payload: dict):
+    # IMPORTANT: must include user_id for RLS WITH CHECK
+    payload = dict(payload)
+    payload["user_id"] = user_id
+    return supabase.table("jobs").insert(payload).execute()
+
+
+def update_job(user_id: str, job_id: int, payload: dict):
+    # only update your own row
+    return supabase.table("jobs").update(payload).eq("id", job_id).eq("user_id", user_id).execute()
+
+
+def delete_job(user_id: str, job_id: int):
+    return supabase.table("jobs").delete().eq("id", job_id).eq("user_id", user_id).execute()
+
+
+# ---------------------------
+# Auth gate
+# ---------------------------
+user = get_user()
+if not user:
+    require_login_ui()
+
+# Logout button
+top_cols = st.columns([1, 1, 6])
+with top_cols[0]:
+    st.write("")
+with top_cols[1]:
+    if st.button("Logout", key="logout_btn"):
+        try:
+            supabase.auth.sign_out()
+        except Exception:
+            pass
+        st.session_state.pop("sb_access_token", None)
+        st.session_state.pop("sb_refresh_token", None)
+        st.rerun()
+
+st.title("Job Application Tracker")
+
+# ---------------------------
+# Add new application
+# ---------------------------
+with st.expander("➕ Add New Application", expanded=True):
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        company = st.text_input("Company Name", key="add_company")
+        visa = st.selectbox("Visa Sponsorship", VISA_OPTIONS, index=1, key="add_visa")
+    with c2:
+        position = st.text_input("Position", key="add_position")
+        status = st.selectbox("Status", STATUS_OPTIONS, index=0, key="add_status")
+    with c3:
+        date_applied = st.date_input("Date Applied", value=date.today(), key="add_date")
+        last_update = st.selectbox("Last Update", LAST_UPDATE_OPTIONS, index=LAST_UPDATE_OPTIONS.index("Submitted"), key="add_last_update")
+
+    if st.button("Save Job", key="save_job_btn"):
+        if not company.strip() or not position.strip():
+            st.error("Company and Position are required.")
+        else:
+            try:
+                insert_job(
+                    user.id,
+                    {
+                        "date_applied": date_applied.isoformat(),
+                        "company": company.strip(),
+                        "position": position.strip(),
+                        "visa": visa,
+                        "status": status,
+                        "last_update": last_update,
+                    },
+                )
+                st.success("Saved.")
+                # clear inputs (simple way)
+                for k in ["add_company", "add_position"]:
+                    st.session_state[k] = ""
+                st.rerun()
+            except Exception as e:
+                st.error(f"Failed to save: {e}")
+
+# ---------------------------
+# Load data
+# ---------------------------
+df = fetch_jobs(user.id)
+
+st.subheader("Applications List")
+
+# ---------------------------
+# Compute colors + sorting helpers
+# ---------------------------
+if not df.empty:
+    df["_color_group"] = df.apply(color_group, axis=1)
+    df["_group_rank"] = df["_color_group"].apply(group_rank)
+else:
+    df["_color_group"] = []
+    df["_group_rank"] = []
+
+# ---------------------------
+# Filters + Search + Sort
+# ---------------------------
+f1, f2, f3, f4, f5 = st.columns([3, 2, 2, 2, 2])
+
+with f1:
+    q = st.text_input("Search (company / position / status / last update)", value="", key="search_q")
+with f2:
+    status_filter = st.selectbox("Status Filter", ["All"] + STATUS_OPTIONS, key="status_filter")
+with f3:
+    visa_filter = st.selectbox("Visa Filter", ["All"] + VISA_OPTIONS, key="visa_filter")
+with f4:
+    color_filter = st.selectbox("Color Group", ["All", "green", "yellow", "orange", "red"], key="color_filter")
+with f5:
+    sort_mode = st.selectbox(
+        "Sort",
+        ["Auto (best)", "Date Applied (newest)", "Date Applied (oldest)", "Company (A-Z)", "Company (Z-A)"],
+        key="sort_mode",
+    )
+
+filtered = df.copy()
+
+# search
+if q.strip():
+    qq = q.strip().lower()
+    for col in ["company", "position", "status", "last_update"]:
+        if col not in filtered.columns:
+            filtered[col] = ""
+    mask = (
+        filtered["company"].astype(str).str.lower().str.contains(qq, na=False)
+        | filtered["position"].astype(str).str.lower().str.contains(qq, na=False)
+        | filtered["status"].astype(str).str.lower().str.contains(qq, na=False)
+        | filtered["last_update"].astype(str).str.lower().str.contains(qq, na=False)
+    )
+    filtered = filtered[mask]
+
+# status filter
+if status_filter != "All":
+    filtered = filtered[filtered["status"] == status_filter]
+
+# visa filter
+if visa_filter != "All":
+    filtered = filtered[filtered["visa"] == visa_filter]
+
+# color filter
+if color_filter != "All":
+    filtered = filtered[filtered["_color_group"] == color_filter]
+
+# sorting
+if not filtered.empty:
+    if sort_mode == "Auto (best)":
+        # Green -> Yellow -> Orange -> Red, then newest date applied
+        filtered = filtered.sort_values(by=["_group_rank", "date_applied"], ascending=[True, False], kind="mergesort")
+    elif sort_mode == "Date Applied (newest)":
+        filtered = filtered.sort_values(by=["date_applied"], ascending=[False], kind="mergesort")
+    elif sort_mode == "Date Applied (oldest)":
+        filtered = filtered.sort_values(by=["date_applied"], ascending=[True], kind="mergesort")
+    elif sort_mode == "Company (A-Z)":
+        filtered = filtered.sort_values(by=["company"], ascending=[True], kind="mergesort")
+    elif sort_mode == "Company (Z-A)":
+        filtered = filtered.sort_values(by=["company"], ascending=[False], kind="mergesort")
+
+# Build display table WITHOUT helper columns
+display_cols = ["id", "date_applied", "company", "position", "visa", "status", "last_update"]
+for c in display_cols:
+    if c not in filtered.columns:
+        filtered[c] = ""
+
+display_df = filtered[display_cols].copy()
+display_df = display_df.rename(
+    columns={
+        "id": "Job #",
+        "date_applied": "Date Applied",
+        "company": "Company",
+        "position": "Position",
+        "visa": "Visa Sponsorship",
+        "status": "Status",
+        "last_update": "Last Update",
+    }
+)
+
+# styling needs _color_group, so merge it back temporarily for style only
+style_df = display_df.copy()
+style_df["_color_group"] = filtered["_color_group"].values if "_color_group" in filtered.columns else ""
+
+styled = style_rows(style_df)
+
+# hide helper column in rendered table (but keep it for row style)
+styled = styled.hide(columns=["_color_group"], axis=1)
+
+st.dataframe(styled, use_container_width=True, height=360)
+
+st.caption(
+    f"Rules: Red=Rejected | Green=In Process / interview / assessment / offer etc. | "
+    f"Orange=Applied + (Submitted/No Update Yet) AND ≥ {ORANGE_DAYS} days | Yellow=Other ongoing. "
+    "Auto sort: Green → Yellow → Orange → Red, then newest Date Applied."
+)
+
+# ---------------------------
+# Edit / Delete section
+# ---------------------------
+st.subheader("Edit / Update Existing Entry")
+
+if df.empty:
+    st.info("No jobs yet. Add one above.")
+else:
+    # Show a selector by Job id + company/position
+    df_pick = df.copy()
+    df_pick["label"] = df_pick.apply(
+        lambda r: f'#{r["id"]} — {r.get("company","")} / {r.get("position","")} ({r.get("status","")})',
         axis=1,
     )
 
-    # -----------------------------
-    # FILTERS / SEARCH / SORT
-    # -----------------------------
-    st.subheader("Applications List")
+    pick = st.selectbox("Select a job to edit", df_pick["label"].tolist(), key="edit_pick")
+    current = df_pick[df_pick["label"] == pick].iloc[0].to_dict()
+    job_id = int(current["id"])
 
-    f1, f2, f3, f4, f5 = st.columns([2.6, 1.3, 1.3, 1.3, 1.3])
-
-    with f1:
-        q = st.text_input("Search (company / position / status / last update)", "").strip().lower()
-    with f2:
-        status_filter = st.selectbox("Status Filter", ["All"] + STATUS_OPTIONS, index=0)
-    with f3:
-        visa_filter = st.selectbox("Visa Filter", ["All"] + VISA_OPTIONS, index=0)
-    with f4:
-        color_filter = st.selectbox("Color Group", ["All", "Green", "Yellow", "Orange", "Red"], index=0)
-    with f5:
-        sort_mode = st.selectbox(
-            "Sort",
-            [
-                "Auto (best)",
-                "Date Applied (newest first)",
-                "Date Applied (oldest first)",
-                "Company (A→Z)",
-                "Company (Z→A)",
-            ],
-            index=0,
-        )
-
-    work = df.copy()
-    work["_group"] = groups.values
-    work["_group_rank"] = work["_group"].apply(group_rank)
-    work["_date_sort"] = work["date_applied"].apply(lambda d: d if isinstance(d, date) else date.min)
-
-    # Search
-    if q:
-        mask = (
-            work["company"].str.lower().str.contains(q, na=False)
-            | work["position"].str.lower().str.contains(q, na=False)
-            | work["status"].str.lower().str.contains(q, na=False)
-            | work["last_update"].str.lower().str.contains(q, na=False)
-        )
-        work = work[mask]
-
-    # Filters
-    if status_filter != "All":
-        work = work[work["status"] == status_filter]
-    if visa_filter != "All":
-        work = work[work["visa"] == visa_filter]
-    if color_filter != "All":
-        work = work[work["_group"] == color_filter]
-
-    # Sort
-    if sort_mode == "Auto (best)":
-        work = work.sort_values(by=["_group_rank", "_date_sort"], ascending=[True, False])
-    elif sort_mode == "Date Applied (newest first)":
-        work = work.sort_values(by=["_date_sort"], ascending=[False])
-    elif sort_mode == "Date Applied (oldest first)":
-        work = work.sort_values(by=["_date_sort"], ascending=[True])
-    elif sort_mode == "Company (A→Z)":
-        work = work.sort_values(by=["company", "_date_sort"], ascending=[True, False])
-    elif sort_mode == "Company (Z→A)":
-        work = work.sort_values(by=["company", "_date_sort"], ascending=[False, False])
-
-    work = work.reset_index(drop=True)
-    work["Job #"] = work.index + 1
-
-    # DISPLAY: friendly headers (no underscores)
-    df_display = work[["Job #", "date_applied", "company", "position", "visa", "status", "last_update"]].copy()
-    df_display = df_display.rename(
-        columns={
-            "date_applied": "Date Applied",
-            "company": "Company",
-            "position": "Position",
-            "visa": "Visa Sponsorship",
-            "status": "Status",
-            "last_update": "Last Update",
-        }
-    )
-
-    sorted_groups = work["_group"].reset_index(drop=True)
-
-    st.dataframe(
-        style_rows(df_display, sorted_groups),
-        use_container_width=True,
-        hide_index=True,
-    )
-
-    st.caption(
-        f"Rules: Red=Rejected | Green=Progress (assessment/interviews/offers) | "
-        f"Orange=Applied + No Update Yet ≥ {NO_UPDATE_DAYS_THRESHOLD} days | Yellow=Applied/early stage."
-    )
-
-    # -----------------------------
-    # EDIT / DELETE
-    # -----------------------------
-    st.markdown("---")
-    st.subheader("Edit / Update an Existing Entry")
-
-    if work.empty:
-        st.info("No results match your filters.")
-        st.stop()
-
-    pick_job_no = st.selectbox("Select Job #", work["Job #"].tolist(), index=0, key="pick_job_no")
-    selected_row = work.loc[work["Job #"] == pick_job_no].iloc[0]
-    selected_id = int(selected_row["id"])
-
-    ec1, ec2, ec3 = st.columns(3)
-    with ec1:
-        new_company = st.text_input("Company", value=str(selected_row["company"]), key=f"edit_company_{selected_id}")
+    e1, e2, e3 = st.columns(3)
+    with e1:
+        new_company = st.text_input("Company Name", value=str(current.get("company", "")), key=f"edit_company_{job_id}")
         new_visa = st.selectbox(
             "Visa Sponsorship",
             VISA_OPTIONS,
-            index=VISA_OPTIONS.index(str(selected_row["visa"])) if str(selected_row["visa"]) in VISA_OPTIONS else 0,
-            key=f"edit_visa_{selected_id}",
+            index=VISA_OPTIONS.index(str(current.get("visa", "No"))) if str(current.get("visa", "No")) in VISA_OPTIONS else 1,
+            key=f"edit_visa_{job_id}",
         )
-    with ec2:
-        new_position = st.text_input("Position", value=str(selected_row["position"]), key=f"edit_position_{selected_id}")
+    with e2:
+        new_position = st.text_input("Position", value=str(current.get("position", "")), key=f"edit_position_{job_id}")
         new_status = st.selectbox(
             "Status",
             STATUS_OPTIONS,
-            index=STATUS_OPTIONS.index(str(selected_row["status"])) if str(selected_row["status"]) in STATUS_OPTIONS else 0,
-            key=f"edit_status_{selected_id}",
+            index=STATUS_OPTIONS.index(str(current.get("status", "Applied"))) if str(current.get("status", "Applied")) in STATUS_OPTIONS else 0,
+            key=f"edit_status_{job_id}",
         )
-    with ec3:
-        new_date_applied = st.date_input(
-            "Date Applied",
-            value=safe_date(selected_row["date_applied"]) or date.today(),
-            key=f"edit_date_{selected_id}",
-        )
+    with e3:
+        cur_date = _safe_date(current.get("date_applied")) or date.today()
+        new_date_applied = st.date_input("Date Applied", value=cur_date, key=f"edit_date_{job_id}")
         new_last_update = st.selectbox(
             "Last Update",
             LAST_UPDATE_OPTIONS,
-            index=LAST_UPDATE_OPTIONS.index(str(selected_row["last_update"]))
-            if str(selected_row["last_update"]) in LAST_UPDATE_OPTIONS
-            else 0,
-            key=f"edit_last_{selected_id}",
+            index=LAST_UPDATE_OPTIONS.index(str(current.get("last_update", "Submitted"))) if str(current.get("last_update", "Submitted")) in LAST_UPDATE_OPTIONS else 0,
+            key=f"edit_lastupdate_{job_id}",
         )
 
-    b1, b2, _ = st.columns([1, 1, 6])
+    b1, b2 = st.columns([1, 5])
     with b1:
-        if st.button("Update Job", key=f"btn_update_{selected_id}"):
-            payload = {
-                "user_id": user_id,  # keep RLS happy
-                "date_applied": new_date_applied.isoformat(),
-                "company": new_company.strip(),
-                "position": new_position.strip(),
-                "visa": new_visa,
-                "status": new_status,
-                "last_update": new_last_update,
-            }
+        if st.button("Save Changes", key=f"save_changes_{job_id}"):
             try:
-                do_update_job(sb, access_token, selected_id, payload)
+                update_job(
+                    user.id,
+                    job_id,
+                    {
+                        "company": new_company.strip(),
+                        "position": new_position.strip(),
+                        "visa": new_visa,
+                        "status": new_status,
+                        "last_update": new_last_update,
+                        "date_applied": new_date_applied.isoformat(),
+                    },
+                )
                 st.success("Updated.")
                 st.rerun()
             except Exception as e:
-                st.error(f"Update failed: {e}")
+                st.error(f"Failed to update: {e}")
 
     with b2:
-        if st.button("Delete Job", key=f"btn_delete_{selected_id}"):
+        if st.button("Delete This Job", key=f"delete_{job_id}"):
             try:
-                do_delete_job(sb, access_token, selected_id)
+                delete_job(user.id, job_id)
                 st.success("Deleted.")
                 st.rerun()
             except Exception as e:
-                st.error(f"Delete failed: {e}")
-
-
-if __name__ == "__main__":
-    main()
+                st.error(f"Failed to delete: {e}")
