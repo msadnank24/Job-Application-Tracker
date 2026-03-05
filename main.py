@@ -1,335 +1,372 @@
-import sqlite3
 import streamlit as st
 import pandas as pd
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
+from supabase import create_client, Client
 
-# ----------------------------
-# DB (persistent storage)
-# Existing schema uses: date, company, position, visa, status, last_update
-# ----------------------------
-conn = sqlite3.connect("jobs.db", check_same_thread=False)
-cursor = conn.cursor()
-
-cursor.execute("""
-CREATE TABLE IF NOT EXISTS jobs (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    date TEXT,
-    company TEXT,
-    position TEXT,
-    visa TEXT,
-    status TEXT,
-    last_update TEXT
-)
-""")
-conn.commit()
-
-# ----------------------------
-# UI
-# ----------------------------
+# -----------------------------
+# Config
+# -----------------------------
 st.set_page_config(page_title="Job Application Tracker", layout="wide")
-st.title("Job Application Tracker")
 
-# Your rule: Orange = no update for a long time
-NO_UPDATE_DAYS = 21  # change to 30 if you prefer
-
-# Color palette (readable orange + black text)
-COLORS = {
-    "red":    "#e74c3c",
-    "green":  "#27ae60",
-    "yellow": "#f7dc6f",
-    "orange": "#f8c471",
-}
-
-# Sorting priority: Green (top), Yellow, Orange, Red (bottom)
-COLOR_PRIORITY = {"green": 1, "yellow": 2, "orange": 3, "red": 4}
-
-STATUS_OPTIONS = ["Applied", "In Process", "Rejected", "No Response"]
-
+STATUS_OPTIONS = ["Applied", "In Process", "Rejected"]
 LAST_UPDATE_OPTIONS = [
     "Submitted",
-    "No Update Yet",
-    "Follow-up Sent",
-    "Recruiter Replied",
+    "Assessment Sent",
     "Phone Screen Scheduled",
-    "Phone Screen Completed",
     "Interview Scheduled",
     "Interview Completed",
-    "Assessment Sent",
-    "Assessment Submitted",
-    "Offer Received",
+    "Offer",
     "Rejected",
+    "No Update Yet",
 ]
 
-# "Green" last updates: recruitment progress signals
-GREEN_LAST_UPDATES = {
-    "Recruiter Replied",
-    "Phone Screen Scheduled",
-    "Phone Screen Completed",
-    "Interview Scheduled",
-    "Interview Completed",
-    "Assessment Sent",
-    "Assessment Submitted",
-    "Offer Received",
-}
+# Color rules (as you described)
+# Red = Rejected
+# Green = In recruitment process (Status == In Process)
+# Yellow = Applied recently / ongoing
+# Orange = No update for long time (>= 21 days since date_applied)
+NO_UPDATE_DAYS = 21
 
-def parse_iso_date(d) -> date:
+# Sort order: Green (top) -> Yellow -> Orange -> Red (bottom)
+GROUP_ORDER = {"green": 0, "yellow": 1, "orange": 2, "red": 3}
+
+# -----------------------------
+# Supabase client
+# -----------------------------
+def get_supabase() -> Client:
+    url = st.secrets.get("SUPABASE_URL", "")
+    key = st.secrets.get("SUPABASE_ANON_KEY", "")
+    if not url or not key:
+        st.error("Missing SUPABASE_URL / SUPABASE_ANON_KEY in Streamlit Secrets.")
+        st.stop()
+    return create_client(url, key)
+
+sb = get_supabase()
+
+# -----------------------------
+# Auth helpers
+# -----------------------------
+def is_logged_in() -> bool:
+    return st.session_state.get("sb_user") is not None
+
+def current_user_id():
+    u = st.session_state.get("sb_user")
+    return u.get("id") if u else None
+
+def logout():
     try:
-        return datetime.fromisoformat(str(d)).date()
+        sb.auth.sign_out()
     except Exception:
-        return date.today()
+        pass
+    st.session_state["sb_user"] = None
+    st.session_state["sb_session"] = None
+    st.rerun()
 
-def load_jobs_raw() -> pd.DataFrame:
-    return pd.read_sql_query("SELECT * FROM jobs", conn)
+def login_ui():
+    st.sidebar.header("Account")
 
-def classify_row(raw_row) -> tuple[str, str, int]:
-    """
-    Returns:
-      (color_name, bg_hex, priority)
+    if is_logged_in():
+        u = st.session_state["sb_user"]
+        st.sidebar.success(f"Logged in: {u.get('email', '')}")
+        if st.sidebar.button("Log out"):
+            logout()
+        return
 
-    Your rules:
-    - Red: rejected
-    - Green: in recruitment process
-    - Orange: no update for a long time
-    - Yellow: applied recently / ongoing
-    """
-    status = str(raw_row.get("status", "")).strip()
-    last_update = str(raw_row.get("last_update", "")).strip()
-    applied_dt = parse_iso_date(raw_row.get("date", ""))
+    tab1, tab2 = st.sidebar.tabs(["Login", "Sign up"])
 
-    days_since = (date.today() - applied_dt).days
-
-    # Red if rejected anywhere
-    if status.lower() == "rejected" or last_update.lower() == "rejected":
-        return "red", COLORS["red"], COLOR_PRIORITY["red"]
-
-    # Green if in process OR last_update indicates progress
-    if status == "In Process" or last_update in GREEN_LAST_UPDATES:
-        return "green", COLORS["green"], COLOR_PRIORITY["green"]
-
-    # Orange if old/no update for long time
-    if days_since >= NO_UPDATE_DAYS:
-        return "orange", COLORS["orange"], COLOR_PRIORITY["orange"]
-
-    # Yellow otherwise (recent/ongoing)
-    return "yellow", COLORS["yellow"], COLOR_PRIORITY["yellow"]
-
-def text_color_for(color_name: str) -> str:
-    # readable text on each bg
-    if color_name in {"red", "green"}:
-        return "#ffffff"
-    return "#000000"
-
-def style_rows(display_df: pd.DataFrame, meta_colors: list[str]):
-    """Apply background+text color per row using meta_colors list aligned with display_df rows."""
-    def _apply(row, i=[-1]):
-        i[0] += 1
-        c = meta_colors[i[0]]
-        bg = COLORS[c]
-        fg = text_color_for(c)
-        return [f"background-color: {bg}; color: {fg};" for _ in row]
-    return display_df.style.apply(_apply, axis=1)
-
-# ----------------------------
-# Add new job
-# ----------------------------
-with st.expander("➕ Add New Application", expanded=True):
-    c1, c2, c3 = st.columns(3)
-    with c1:
-        company = st.text_input("Company Name", key="add_company")
-        position = st.text_input("Position", key="add_position")
-    with c2:
-        job_date = st.date_input("Date Applied", value=date.today(), key="add_date")
-        visa = st.selectbox("Visa Sponsorship", ["Yes", "No"], key="add_visa")
-    with c3:
-        status = st.selectbox("Status", STATUS_OPTIONS, key="add_status")
-        last_update = st.selectbox("Last Update", LAST_UPDATE_OPTIONS, key="add_last_update")
-
-    if st.button("Save Job", key="add_save"):
-        if not company.strip() or not position.strip():
-            st.error("Company Name and Position are required.")
-        else:
-            cursor.execute("""
-                INSERT INTO jobs (date, company, position, visa, status, last_update)
-                VALUES (?, ?, ?, ?, ?, ?)
-            """, (str(job_date), company.strip(), position.strip(), visa, status, last_update))
-            conn.commit()
-            st.success("Saved ✅")
-            st.rerun()
-
-# ----------------------------
-# Filters + search
-# ----------------------------
-st.divider()
-st.subheader("Find / Filter")
-
-f1, f2, f3, f4 = st.columns([1, 1, 1, 2])
-
-with f1:
-    filter_status = st.selectbox("Filter by Status", ["All"] + STATUS_OPTIONS, key="filter_status")
-with f2:
-    filter_visa = st.selectbox("Filter by Visa", ["All", "Yes", "No"], key="filter_visa")
-with f3:
-    filter_color = st.selectbox("Filter by Color Group", ["All", "Green", "Yellow", "Orange", "Red"], key="filter_color")
-with f4:
-    q = st.text_input("Search (company / position / last update)", key="search_q").strip().lower()
-
-# ----------------------------
-# Edit existing entry
-# ----------------------------
-with st.expander("✏️ Edit Existing Application (updates change colors automatically)", expanded=False):
-    raw_for_edit = load_jobs_raw()
-
-    if raw_for_edit.empty:
-        st.info("No jobs to edit yet.")
-    else:
-        # build dropdown list
-        labels = []
-        label_to_id = {}
-        for _, r in raw_for_edit.sort_values("id", ascending=False).iterrows():
-            rid = int(r["id"])
-            labels.append(f'#{rid} | {r["company"]} — {r["position"]} ({r["date"]})')
-            label_to_id[labels[-1]] = rid
-
-        chosen_label = st.selectbox("Select a job", labels, key="edit_pick")
-        chosen_id = label_to_id[chosen_label]
-        current = raw_for_edit[raw_for_edit["id"] == chosen_id].iloc[0]
-
-        ec1, ec2, ec3 = st.columns(3)
-        with ec1:
-            new_company = st.text_input("Company", value=str(current["company"]), key=f"edit_company_{chosen_id}")
-            new_position = st.text_input("Position", value=str(current["position"]), key=f"edit_position_{chosen_id}")
-        with ec2:
-            new_date = st.date_input("Date Applied", value=parse_iso_date(current["date"]), key=f"edit_date_{chosen_id}")
-            new_visa = st.selectbox(
-                "Visa Sponsorship",
-                ["Yes", "No"],
-                index=0 if str(current["visa"]) == "Yes" else 1,
-                key=f"edit_visa_{chosen_id}"
-            )
-        with ec3:
-            cur_status = str(current["status"])
-            status_index = STATUS_OPTIONS.index(cur_status) if cur_status in STATUS_OPTIONS else 0
-            new_status = st.selectbox(
-                "Status",
-                STATUS_OPTIONS,
-                index=status_index,
-                key=f"edit_status_{chosen_id}"
-            )
-
-            # EXACT same dropdown options as "Add New"
-            lu_val = str(current["last_update"])
-            lu_index = LAST_UPDATE_OPTIONS.index(lu_val) if lu_val in LAST_UPDATE_OPTIONS else 0
-            new_last_update = st.selectbox(
-                "Last Update",
-                LAST_UPDATE_OPTIONS,
-                index=lu_index,
-                key=f"edit_last_update_{chosen_id}"
-            )
-
-        s1, s2 = st.columns([1, 1])
-        with s1:
-            if st.button("Save Changes", key=f"edit_save_{chosen_id}"):
-                if not new_company.strip() or not new_position.strip():
-                    st.error("Company and Position cannot be empty.")
-                else:
-                    cursor.execute("""
-                        UPDATE jobs
-                        SET date=?, company=?, position=?, visa=?, status=?, last_update=?
-                        WHERE id=?
-                    """, (
-                        str(new_date),
-                        new_company.strip(),
-                        new_position.strip(),
-                        new_visa,
-                        new_status,
-                        new_last_update,
-                        chosen_id
-                    ))
-                    conn.commit()
-                    st.success("Updated ✅")
-                    st.rerun()
-
-        with s2:
-            if st.button("Delete Entry", key=f"edit_delete_{chosen_id}"):
-                cursor.execute("DELETE FROM jobs WHERE id=?", (chosen_id,))
-                conn.commit()
-                st.warning("Deleted.")
+    with tab1:
+        email = st.text_input("Email", key="login_email")
+        password = st.text_input("Password", type="password", key="login_pw")
+        if st.button("Login"):
+            try:
+                res = sb.auth.sign_in_with_password({"email": email, "password": password})
+                st.session_state["sb_session"] = res.session.model_dump() if res.session else None
+                st.session_state["sb_user"] = res.user.model_dump() if res.user else None
+                st.success("Logged in!")
                 st.rerun()
+            except Exception as e:
+                st.error(f"Login failed: {e}")
 
-# ----------------------------
-# Build display table with classification + sorting + filtering
-# ----------------------------
-st.divider()
-st.subheader("Applications List")
+    with tab2:
+        email2 = st.text_input("Email", key="signup_email")
+        password2 = st.text_input("Password", type="password", key="signup_pw")
+        if st.button("Create account"):
+            try:
+                res = sb.auth.sign_up({"email": email2, "password": password2})
+                # If email confirmation is ON in Supabase, user must confirm email.
+                st.success("Account created. If confirmation is enabled, check your email.")
+            except Exception as e:
+                st.error(f"Signup failed: {e}")
 
-raw_df = load_jobs_raw()
+# -----------------------------
+# DB helpers
+# -----------------------------
+def fetch_jobs(user_id: str) -> pd.DataFrame:
+    resp = sb.table("jobs").select("*").eq("user_id", user_id).execute()
+    data = resp.data or []
+    df = pd.DataFrame(data)
+    if df.empty:
+        return pd.DataFrame(columns=[
+            "id", "user_id", "date_applied", "company", "position", "visa", "status", "last_update", "created_at"
+        ])
+    # Normalize dates
+    if "date_applied" in df.columns:
+        df["date_applied"] = pd.to_datetime(df["date_applied"]).dt.date
+    if "created_at" in df.columns:
+        df["created_at"] = pd.to_datetime(df["created_at"], errors="coerce")
+    return df
 
-if raw_df.empty:
-    st.info("No saved jobs yet.")
-else:
-    # Add computed fields: color group, priority, parsed date
-    color_names = []
-    priorities = []
-    parsed_dates = []
-    for _, r in raw_df.iterrows():
-        cname, _, pr = classify_row(r)
-        color_names.append(cname)
-        priorities.append(pr)
-        parsed_dates.append(parse_iso_date(r["date"]))
+def insert_job(user_id: str, date_applied: date, company: str, position: str, visa: str, status: str, last_update: str):
+    sb.table("jobs").insert({
+        "user_id": user_id,
+        "date_applied": str(date_applied),
+        "company": company.strip(),
+        "position": position.strip(),
+        "visa": visa,
+        "status": status,
+        "last_update": last_update
+    }).execute()
 
-    raw_df = raw_df.copy()
-    raw_df["__color"] = color_names
-    raw_df["__priority"] = priorities
-    raw_df["__date_parsed"] = parsed_dates
+def update_job(job_id: int, updates: dict):
+    # dates must be string
+    if "date_applied" in updates and isinstance(updates["date_applied"], date):
+        updates["date_applied"] = str(updates["date_applied"])
+    sb.table("jobs").update(updates).eq("id", job_id).execute()
 
-    # Apply filters
-    filtered = raw_df
+def delete_job(job_id: int):
+    sb.table("jobs").delete().eq("id", job_id).execute()
 
-    if filter_status != "All":
-        filtered = filtered[filtered["status"] == filter_status]
+# -----------------------------
+# Coloring + sorting
+# -----------------------------
+def compute_group(row) -> str:
+    status = str(row.get("status", ""))
+    last_update = str(row.get("last_update", ""))
+    d = row.get("date_applied")
 
-    if filter_visa != "All":
-        filtered = filtered[filtered["visa"] == filter_visa]
+    if status == "Rejected" or last_update == "Rejected":
+        return "red"
+    if status == "In Process":
+        return "green"
 
-    if filter_color != "All":
-        fc = filter_color.lower()
-        filtered = filtered[filtered["__color"] == fc]
+    # Applied / other -> decide yellow vs orange based on age if no update
+    # "No Update Yet" means we consider the time rule
+    if last_update == "No Update Yet":
+        if isinstance(d, date):
+            if (date.today() - d).days >= NO_UPDATE_DAYS:
+                return "orange"
+        return "yellow"
 
-    if q:
-        def row_matches(r):
-            hay = f'{r["company"]} {r["position"]} {r["last_update"]}'.lower()
-            return q in hay
-        filtered = filtered[filtered.apply(row_matches, axis=1)]
+    # If they have some activity (assessment/interview/etc) but status still Applied,
+    # treat as yellow ongoing
+    return "yellow"
 
-    # Sort: Green -> Yellow -> Orange -> Red, then by Date Applied (newest first), then by id desc
-    filtered = filtered.sort_values(
-        by=["__priority", "__date_parsed", "id"],
-        ascending=[True, False, False]
+def style_rows(df: pd.DataFrame) -> pd.DataFrame:
+    # background colors chosen for readability (orange fixed to be readable)
+    def row_style(row):
+        grp = row["_group"]
+        if grp == "green":
+            return ["background-color: #1f9d55; color: white;"] * len(row)
+        if grp == "yellow":
+            return ["background-color: #f2d45c; color: black;"] * len(row)
+        if grp == "orange":
+            return ["background-color: #f59e0b; color: black;"] * len(row)  # readable orange
+        if grp == "red":
+            return ["background-color: #dc2626; color: white;"] * len(row)
+        return [""] * len(row)
+
+    return df.style.apply(row_style, axis=1)
+
+def sort_jobs(df: pd.DataFrame) -> pd.DataFrame:
+    if df.empty:
+        return df
+
+    df["_group"] = df.apply(compute_group, axis=1)
+    df["_group_order"] = df["_group"].map(GROUP_ORDER).fillna(99)
+
+    # Sort by group order then by date_applied (newest first) then created_at (newest first)
+    # Rejected always bottom due to group order
+    df = df.sort_values(
+        by=["_group_order", "date_applied", "created_at"],
+        ascending=[True, False, False],
+        na_position="last"
     ).reset_index(drop=True)
 
-    # Build pretty display df
-    display_df = filtered.rename(columns={
-        "date": "Date Applied",
+    # Add Job # numbering after sorting
+    df.insert(0, "Job #", range(1, len(df) + 1))
+    return df
+
+# -----------------------------
+# App UI
+# -----------------------------
+st.title("Job Application Tracker")
+
+# Show login UI in sidebar
+login_ui()
+
+if not is_logged_in():
+    st.info("Please log in or sign up in the sidebar to use your personal tracker.")
+    st.stop()
+
+uid = current_user_id()
+
+# Load jobs
+df = fetch_jobs(uid)
+df = sort_jobs(df)
+
+# -----------------------------
+# Filters / Search
+# -----------------------------
+with st.expander("🔎 Filter & Search", expanded=False):
+    colA, colB, colC, colD = st.columns([2, 2, 2, 2])
+
+    search_text = colA.text_input("Search (company / position)", value="")
+    filter_status = colB.multiselect("Filter by Status", STATUS_OPTIONS, default=[])
+    filter_visa = colC.multiselect("Filter by Visa Sponsorship", ["Yes", "No"], default=[])
+    filter_group = colD.multiselect("Filter by Color Group", ["green", "yellow", "orange", "red"], default=[])
+
+def apply_filters(df_in: pd.DataFrame) -> pd.DataFrame:
+    out = df_in.copy()
+    if out.empty:
+        return out
+
+    if search_text.strip():
+        s = search_text.strip().lower()
+        out = out[
+            out["company"].astype(str).str.lower().str.contains(s, na=False) |
+            out["position"].astype(str).str.lower().str.contains(s, na=False)
+        ]
+
+    if filter_status:
+        out = out[out["status"].isin(filter_status)]
+
+    if filter_visa:
+        out = out[out["visa"].isin(filter_visa)]
+
+    if filter_group:
+        out = out[out["_group"].isin(filter_group)]
+
+    # re-number after filtering
+    out = out.reset_index(drop=True)
+    if "Job #" in out.columns:
+        out["Job #"] = range(1, len(out) + 1)
+    return out
+
+df_view = apply_filters(df)
+
+# -----------------------------
+# Add new job
+# -----------------------------
+with st.expander("➕ Add New Application", expanded=True):
+    c1, c2, c3 = st.columns(3)
+    company = c1.text_input("Company Name", value="")
+    position = c2.text_input("Position", value="")
+    date_applied = c3.date_input("Date Applied", value=date.today())
+
+    c4, c5, c6 = st.columns(3)
+    visa = c4.selectbox("Visa Sponsorship", ["Yes", "No"], index=1)
+    status = c5.selectbox("Status", STATUS_OPTIONS, index=0)
+    last_update = c6.selectbox("Last Update", LAST_UPDATE_OPTIONS, index=LAST_UPDATE_OPTIONS.index("Submitted"))
+
+    if st.button("Save Job"):
+        if not company.strip() or not position.strip():
+            st.warning("Company and Position are required.")
+        else:
+            try:
+                insert_job(uid, date_applied, company, position, visa, status, last_update)
+                st.success("Saved!")
+                st.rerun()
+            except Exception as e:
+                st.error(f"Failed to save: {e}")
+
+# -----------------------------
+# Edit / Delete existing
+# -----------------------------
+st.subheader("Applications List")
+
+if df_view.empty:
+    st.write("No jobs saved yet.")
+else:
+    # Display styled table (hide internal columns)
+    display_cols = ["Job #", "date_applied", "company", "position", "visa", "status", "last_update"]
+    pretty = df_view.copy()
+    pretty = pretty.rename(columns={
+        "date_applied": "Date Applied",
         "company": "Company",
         "position": "Position",
         "visa": "Visa Sponsorship",
         "status": "Status",
-        "last_update": "Last Update",
-    })[["Date Applied", "Company", "Position", "Visa Sponsorship", "Status", "Last Update"]]
+        "last_update": "Last Update"
+    })
 
-    # Add Job # based on current sorted+filtered view
-    display_df.insert(0, "Job #", range(1, len(display_df) + 1))
+    # Keep group columns for styling, but not shown
+    # We'll style on the actual df_view then display renamed columns
+    # Easiest: style df_view, but select only display cols after styling
+    styled = style_rows(df_view[["Job #","date_applied","company","position","visa","status","last_update","_group"]])
+    # Drop _group from visual but keep styling row-wise by using same dataframe width
+    # We'll just show it as hidden by renaming to blank and narrow; simpler: show without _group
+    # Instead, rebuild style on df_view without _group:
+    styled = style_rows(df_view[["Job #","date_applied","company","position","visa","status","last_update","_group"]]).hide(axis="columns", subset=["_group"])
+    styled = styled.format({"date_applied": lambda x: x.strftime("%Y-%m-%d") if isinstance(x, date) else str(x)})
+    st.dataframe(styled, use_container_width=True, height=340)
 
-    # Color rows based on filtered __color
-    meta_colors = filtered["__color"].tolist()
-
-    st.dataframe(
-        style_rows(display_df, meta_colors),
-        use_container_width=True,
-        hide_index=True
+    st.caption(
+        "Rules: Red=Rejected | Green=In Process | Orange=No update ≥ 21 days (only when Last Update = 'No Update Yet') | Yellow=Recent/Ongoing. "
+        "Sorted: Green → Yellow → Orange → Red, then newest Date Applied."
     )
 
-st.caption(
-    f"Rules: Red=Rejected | Green=In process | Orange=No update ≥ {NO_UPDATE_DAYS} days | Yellow=Recent/Ongoing. "
-    "Sorted: Green → Yellow → Orange → Red, then newest Date Applied first."
-)
+    st.divider()
+    st.subheader("✏️ Edit / Delete a Job")
+
+    # Choose by Job # (stable after sorting/filtering)
+    job_numbers = df_view["Job #"].tolist()
+    selected_job_no = st.selectbox("Select Job # to edit", job_numbers, key="select_job_to_edit")
+
+    # Get row
+    row = df_view[df_view["Job #"] == selected_job_no].iloc[0]
+    job_id = int(row["id"])
+
+    ec1, ec2, ec3 = st.columns(3)
+    new_company = ec1.text_input("Company", value=str(row["company"]), key=f"edit_company_{job_id}")
+    new_position = ec2.text_input("Position", value=str(row["position"]), key=f"edit_position_{job_id}")
+    new_date = ec3.date_input("Date Applied", value=row["date_applied"] if isinstance(row["date_applied"], date) else date.today(), key=f"edit_date_{job_id}")
+
+    ec4, ec5, ec6 = st.columns(3)
+    new_visa = ec4.selectbox("Visa Sponsorship", ["Yes", "No"], index=(0 if str(row["visa"]) == "Yes" else 1), key=f"edit_visa_{job_id}")
+    # Unique keys fix the duplicate selectbox error
+    new_status = ec5.selectbox(
+        "Status",
+        STATUS_OPTIONS,
+        index=STATUS_OPTIONS.index(str(row["status"])) if str(row["status"]) in STATUS_OPTIONS else 0,
+        key=f"edit_status_{job_id}"
+    )
+    new_last_update = ec6.selectbox(
+        "Last Update",
+        LAST_UPDATE_OPTIONS,
+        index=LAST_UPDATE_OPTIONS.index(str(row["last_update"])) if str(row["last_update"]) in LAST_UPDATE_OPTIONS else 0,
+        key=f"edit_lastupdate_{job_id}"
+    )
+
+    b1, b2, b3 = st.columns([1,1,6])
+    if b1.button("Update Job", key=f"btn_update_{job_id}"):
+        try:
+            update_job(job_id, {
+                "company": new_company.strip(),
+                "position": new_position.strip(),
+                "date_applied": new_date,
+                "visa": new_visa,
+                "status": new_status,
+                "last_update": new_last_update
+            })
+            st.success("Updated!")
+            st.rerun()
+        except Exception as e:
+            st.error(f"Update failed: {e}")
+
+    if b2.button("Delete Job", key=f"btn_delete_{job_id}"):
+        try:
+            delete_job(job_id)
+            st.warning("Deleted.")
+            st.rerun()
+        except Exception as e:
+            st.error(f"Delete failed: {e}")
