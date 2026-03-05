@@ -382,7 +382,7 @@ styled = style_rows(tmp_for_style.drop(columns=["_color_group"]).assign(_color_g
 # Because styler needs the same columns, we style display_df by rebuilding a style df with same cols:
 style_base = display_df.copy()
 style_base["_color_group"] = filtered["_color_group"].values
-styled = style_rows(style_base).hide(axis="columns", subset=["_color_group"])
+styled = style_rows(style_base.drop(columns=["_color_group"]))
 
 st.dataframe(styled, use_container_width=True, height=420)
 
@@ -462,3 +462,4 @@ with st.expander("✏️ Edit / Update Existing Application", expanded=False):
                 "Tip: If you get an interview call or rejection, just edit Status / Last Update here. "
                 "Colors + sorting update automatically."
             )
+
