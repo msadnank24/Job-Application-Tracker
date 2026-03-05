@@ -341,7 +341,7 @@ if not view_df.empty:
 # ----------------------------
 # Display table (color coded)
 # ----------------------------
-table_cols = ["Job #", "date_applied", "company", "position", "visa", "status", "last_update", "ColorGroup"]
+table_cols = ["Job #", "date_applied", "company", "position", "visa", "status", "last_update"]
 if view_df.empty:
     st.info("No applications found yet (or filters removed everything).")
 else:
@@ -434,3 +434,4 @@ else:
             st.rerun()
         except Exception as e:
             st.error(f"Delete failed: {e}")
+
