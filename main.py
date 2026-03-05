@@ -195,10 +195,27 @@ def require_user():
 def load_jobs(user_id: str):
     # RLS will already limit, but filtering makes it explicit & safer
     res = (
-        supabase.table("jobs")
-        .select("id,user_id,date_applied,company,position,visa,status,last_update,created_at")
-        .eq("user_id", user_id)
-        .execute()
+        user = supabase.auth.get_user()
+if not user or not user.user:
+    st.error("You are not logged in. Please log in again.")
+else:
+    uid = user.user.id  # this is the auth.uid()
+
+    payload = {
+        "user_id": uid,  # ✅ REQUIRED for RLS policy
+        "date_applied": str(date_applied),
+        "company": company,
+        "position": position,
+        "visa": visa,
+        "status": status,
+        "last_update": last_update,
+    }
+
+    res = supabase.table("jobs").insert(payload).execute()
+    if getattr(res, "error", None):
+        st.error(f"Failed to save: {res.error}")
+    else:
+        st.success("Saved ✅")
     )
     data = res.data or []
     df = pd.DataFrame(data)
@@ -508,4 +525,5 @@ else:
             st.rerun()
         except Exception as e:
             st.error(f"Delete failed: {e}")
+
 
