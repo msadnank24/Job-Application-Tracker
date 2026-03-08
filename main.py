@@ -429,3 +429,23 @@ with b2:
             st.rerun()
         except Exception as e:
             st.error(f"Failed to delete: {e}")
+
+# ---- Footer credit ----
+st.markdown(
+    """
+    <style>
+    .footer {
+        position: fixed;
+        bottom: 10px;
+        left: 10px;
+        font-size: 12px;
+        color: #888888;
+        z-index: 100;
+    }
+    </style>
+    <div class="footer">
+        Built by <b>Saif Adnan Khan</b>
+    </div>
+    """,
+    unsafe_allow_html=True
+)
