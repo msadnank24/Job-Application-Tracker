@@ -1,4 +1,3 @@
-# main.py
 import os
 from datetime import date, datetime
 import pandas as pd
@@ -106,7 +105,7 @@ def color_group(row) -> str:
     if status == "Applied" and (last_update in NO_PROGRESS_UPDATES) and days_since >= ORANGE_DAYS:
         return "orange"
 
-    # YELLOW: everything else ongoing / applied recent
+    # YELLOW
     return "yellow"
 
 
@@ -126,14 +125,35 @@ def row_bg_css(g: str) -> str:
     return ""
 
 
+def get_authed_client():
+    """
+    Build a client with the current user's auth session attached,
+    so RLS works properly for select/insert/update/delete.
+    """
+    client = create_client(SUPABASE_URL, SUPABASE_ANON_KEY)
+
+    access = st.session_state.get("sb_access_token")
+    refresh = st.session_state.get("sb_refresh_token")
+
+    if access and refresh:
+        try:
+            client.auth.set_session(access, refresh)
+        except Exception:
+            pass
+
+    if access:
+        try:
+            client.postgrest.auth(access)
+        except Exception:
+            pass
+
+    return client
+
+
 def get_user():
     try:
-        if st.session_state.get("sb_access_token") and st.session_state.get("sb_refresh_token"):
-            supabase.auth.set_session(
-                st.session_state["sb_access_token"],
-                st.session_state["sb_refresh_token"],
-            )
-        res = supabase.auth.get_user()
+        client = get_authed_client()
+        res = client.auth.get_user()
         return res.user if res else None
     except Exception:
         return None
@@ -172,27 +192,44 @@ def require_login_ui():
 
 
 def fetch_jobs(user_id: str) -> pd.DataFrame:
-    resp = supabase.table("jobs").select("*").eq("user_id", user_id).execute()
+    client = get_authed_client()
+    resp = client.table("jobs").select("*").eq("user_id", user_id).execute()
     rows = resp.data or []
     df = pd.DataFrame(rows)
+
     if df.empty:
-        return pd.DataFrame(columns=["id", "date_applied", "company", "position", "visa", "status", "last_update"])
+        return pd.DataFrame(
+            columns=[
+                "id", "date_applied", "company", "position", "visa", "status", "last_update",
+                "job_link", "salary", "location", "cv_used", "cover_letter_used", "notes"
+            ]
+        )
+
     df["date_applied"] = df["date_applied"].apply(_safe_date)
+
+    # ensure optional columns exist
+    for col in ["job_link", "salary", "location", "cv_used", "cover_letter_used", "notes"]:
+        if col not in df.columns:
+            df[col] = ""
+
     return df
 
 
 def insert_job(user_id: str, payload: dict):
+    client = get_authed_client()
     payload = dict(payload)
-    payload["user_id"] = user_id  # required for RLS
-    return supabase.table("jobs").insert(payload).execute()
+    payload["user_id"] = user_id
+    return client.table("jobs").insert(payload).execute()
 
 
 def update_job(user_id: str, job_id: int, payload: dict):
-    return supabase.table("jobs").update(payload).eq("id", job_id).eq("user_id", user_id).execute()
+    client = get_authed_client()
+    return client.table("jobs").update(payload).eq("id", job_id).eq("user_id", user_id).execute()
 
 
 def delete_job(user_id: str, job_id: int):
-    return supabase.table("jobs").delete().eq("id", job_id).eq("user_id", user_id).execute()
+    client = get_authed_client()
+    return client.table("jobs").delete().eq("id", job_id).eq("user_id", user_id).execute()
 
 
 # ---------------------------
@@ -202,7 +239,7 @@ user = get_user()
 if not user:
     require_login_ui()
 
-# Logout button
+# Logout
 top_cols = st.columns([6, 1])
 with top_cols[1]:
     if st.button("Logout", key="logout_btn"):
@@ -217,7 +254,7 @@ with top_cols[1]:
 st.title("Job Application Tracker")
 
 # ---------------------------
-# Add new application (FORM fixes your session_state error)
+# Add new application
 # ---------------------------
 with st.expander("➕ Add New Application", expanded=True):
     with st.form("add_job_form", clear_on_submit=True):
@@ -236,6 +273,14 @@ with st.expander("➕ Add New Application", expanded=True):
                 index=LAST_UPDATE_OPTIONS.index("Submitted"),
             )
 
+        with st.expander("More Details"):
+            job_link = st.text_input("Job Advert Link")
+            salary = st.text_input("Salary")
+            location = st.text_input("Job Location")
+            cv_used = st.text_area("CV Used")
+            cover_letter_used = st.text_area("Cover Letter Used")
+            notes = st.text_area("Additional Information / Questions Asked / Notes")
+
         submitted = st.form_submit_button("Save Job")
 
         if submitted:
@@ -252,6 +297,12 @@ with st.expander("➕ Add New Application", expanded=True):
                             "visa": visa,
                             "status": status,
                             "last_update": last_update,
+                            "job_link": job_link.strip(),
+                            "salary": salary.strip(),
+                            "location": location.strip(),
+                            "cv_used": cv_used.strip(),
+                            "cover_letter_used": cover_letter_used.strip(),
+                            "notes": notes.strip(),
                         },
                     )
                     st.success("Saved.")
@@ -310,7 +361,6 @@ if not filtered.empty:
     if color_filter != "All":
         filtered = filtered[filtered["_color_group"] == color_filter]
 
-    # Sorting
     if sort_mode == "Auto (best)":
         filtered = filtered.sort_values(by=["_group_rank", "date_applied"], ascending=[True, False], kind="mergesort")
     elif sort_mode == "Date Applied (newest)":
@@ -323,17 +373,16 @@ if not filtered.empty:
         filtered = filtered.sort_values(by=["company"], ascending=[False], kind="mergesort")
 
 # ---------------------------
-# Display table with SERIAL Job # (1..N), not DB id
+# Display table with SERIAL Job #
 # ---------------------------
 if df.empty:
     st.info("No jobs yet. Add one above.")
 else:
-    # Keep groups in a separate aligned series (after reset_index)
     filtered = filtered.reset_index(drop=True)
     groups = filtered["_color_group"].copy()
 
     display_df = pd.DataFrame()
-    display_df["Job #"] = range(1, len(filtered) + 1)  # serial number
+    display_df["Job #"] = range(1, len(filtered) + 1)
     display_df["Date Applied"] = filtered["date_applied"]
     display_df["Company"] = filtered["company"]
     display_df["Position"] = filtered["position"]
@@ -346,6 +395,7 @@ else:
         return [row_bg_css(g)] * len(row)
 
     styled = display_df.style.apply(apply_row_style, axis=1)
+
     st.dataframe(styled, use_container_width=True, height=360)
 
     st.caption(
@@ -355,14 +405,50 @@ else:
     )
 
 # ---------------------------
-# Edit / Delete
+# View more details
 # ---------------------------
-st.subheader("Edit / Update Existing Entry")
+st.subheader("View More Details")
 
 if df.empty:
     st.stop()
 
-df_pick = df.copy()
+filtered_for_details = filtered.copy()
+if filtered_for_details.empty:
+    st.info("No rows match your current filters.")
+    st.stop()
+
+pick_job_no = st.selectbox("Select Job # to View More", range(1, len(filtered_for_details) + 1), index=0, key="view_pick")
+selected_row = filtered_for_details.iloc[pick_job_no - 1]
+
+with st.expander("More Details", expanded=True):
+    st.write(f"**Company:** {selected_row.get('company', '')}")
+    st.write(f"**Position:** {selected_row.get('position', '')}")
+    st.write(f"**Date Applied:** {selected_row.get('date_applied', '')}")
+    st.write(f"**Visa Sponsorship:** {selected_row.get('visa', '')}")
+    st.write(f"**Status:** {selected_row.get('status', '')}")
+    st.write(f"**Last Update:** {selected_row.get('last_update', '')}")
+    st.write(f"**Salary:** {selected_row.get('salary', '')}")
+    st.write(f"**Location:** {selected_row.get('location', '')}")
+
+    job_link = str(selected_row.get("job_link", "") or "").strip()
+    if job_link:
+        st.markdown(f"**Job Advert Link:** [Open Job Advert]({job_link})")
+
+    st.write("**CV Used:**")
+    st.text(selected_row.get("cv_used", "") or "")
+
+    st.write("**Cover Letter Used:**")
+    st.text(selected_row.get("cover_letter_used", "") or "")
+
+    st.write("**Additional Information / Questions Asked / Notes:**")
+    st.text(selected_row.get("notes", "") or "")
+
+# ---------------------------
+# Edit / Delete
+# ---------------------------
+st.subheader("Edit / Update Existing Entry")
+
+df_pick = filtered_for_details.copy()
 df_pick["label"] = df_pick.apply(
     lambda r: f'#{r["id"]} — {r.get("company","")} / {r.get("position","")} ({r.get("status","")})',
     axis=1,
@@ -372,80 +458,72 @@ pick = st.selectbox("Select a job to edit", df_pick["label"].tolist(), key="edit
 current = df_pick[df_pick["label"] == pick].iloc[0].to_dict()
 job_id = int(current["id"])
 
-e1, e2, e3 = st.columns(3)
-with e1:
-    new_company = st.text_input("Company Name", value=str(current.get("company", "")), key=f"edit_company_{job_id}")
-    new_visa = st.selectbox(
-        "Visa Sponsorship",
-        VISA_OPTIONS,
-        index=VISA_OPTIONS.index(str(current.get("visa", "No"))) if str(current.get("visa", "No")) in VISA_OPTIONS else 1,
-        key=f"edit_visa_{job_id}",
-    )
-with e2:
-    new_position = st.text_input("Position", value=str(current.get("position", "")), key=f"edit_position_{job_id}")
-    new_status = st.selectbox(
-        "Status",
-        STATUS_OPTIONS,
-        index=STATUS_OPTIONS.index(str(current.get("status", "Applied"))) if str(current.get("status", "Applied")) in STATUS_OPTIONS else 0,
-        key=f"edit_status_{job_id}",
-    )
-with e3:
-    cur_date = _safe_date(current.get("date_applied")) or date.today()
-    new_date_applied = st.date_input("Date Applied", value=cur_date, key=f"edit_date_{job_id}")
-    new_last_update = st.selectbox(
-        "Last Update",
-        LAST_UPDATE_OPTIONS,
-        index=LAST_UPDATE_OPTIONS.index(str(current.get("last_update", "Submitted"))) if str(current.get("last_update", "Submitted")) in LAST_UPDATE_OPTIONS else 0,
-        key=f"edit_lastupdate_{job_id}",
-    )
+with st.form("edit_job_form"):
+    e1, e2, e3 = st.columns(3)
+    with e1:
+        new_company = st.text_input("Company Name", value=str(current.get("company", "")))
+        new_visa = st.selectbox(
+            "Visa Sponsorship",
+            VISA_OPTIONS,
+            index=VISA_OPTIONS.index(str(current.get("visa", "No"))) if str(current.get("visa", "No")) in VISA_OPTIONS else 1,
+        )
+    with e2:
+        new_position = st.text_input("Position", value=str(current.get("position", "")))
+        new_status = st.selectbox(
+            "Status",
+            STATUS_OPTIONS,
+            index=STATUS_OPTIONS.index(str(current.get("status", "Applied"))) if str(current.get("status", "Applied")) in STATUS_OPTIONS else 0,
+        )
+    with e3:
+        cur_date = _safe_date(current.get("date_applied")) or date.today()
+        new_date_applied = st.date_input("Date Applied", value=cur_date)
+        new_last_update = st.selectbox(
+            "Last Update",
+            LAST_UPDATE_OPTIONS,
+            index=LAST_UPDATE_OPTIONS.index(str(current.get("last_update", "Submitted"))) if str(current.get("last_update", "Submitted")) in LAST_UPDATE_OPTIONS else 0,
+        )
 
-b1, b2 = st.columns([1, 5])
+    with st.expander("More Details"):
+        new_job_link = st.text_input("Job Advert Link", value=str(current.get("job_link", "") or ""))
+        new_salary = st.text_input("Salary", value=str(current.get("salary", "") or ""))
+        new_location = st.text_input("Job Location", value=str(current.get("location", "") or ""))
+        new_cv_used = st.text_area("CV Used", value=str(current.get("cv_used", "") or ""))
+        new_cover_letter_used = st.text_area("Cover Letter Used", value=str(current.get("cover_letter_used", "") or ""))
+        new_notes = st.text_area("Additional Information / Questions Asked / Notes", value=str(current.get("notes", "") or ""))
 
-with b1:
-    if st.button("Save Changes", key=f"save_changes_{job_id}"):
-        try:
-            update_job(
-                user.id,
-                job_id,
-                {
-                    "company": new_company.strip(),
-                    "position": new_position.strip(),
-                    "visa": new_visa,
-                    "status": new_status,
-                    "last_update": new_last_update,
-                    "date_applied": new_date_applied.isoformat(),
-                },
-            )
-            st.success("Updated.")
-            st.rerun()
-        except Exception as e:
-            st.error(f"Failed to update: {e}")
+    b1, b2 = st.columns([1, 5])
+    save_edit = b1.form_submit_button("Save Changes")
+    delete_edit = b2.form_submit_button("Delete This Job")
 
-with b2:
-    if st.button("Delete This Job", key=f"delete_{job_id}"):
-        try:
-            delete_job(user.id, job_id)
-            st.success("Deleted.")
-            st.rerun()
-        except Exception as e:
-            st.error(f"Failed to delete: {e}")
+if save_edit:
+    try:
+        update_job(
+            user.id,
+            job_id,
+            {
+                "company": new_company.strip(),
+                "position": new_position.strip(),
+                "visa": new_visa,
+                "status": new_status,
+                "last_update": new_last_update,
+                "date_applied": new_date_applied.isoformat(),
+                "job_link": new_job_link.strip(),
+                "salary": new_salary.strip(),
+                "location": new_location.strip(),
+                "cv_used": new_cv_used.strip(),
+                "cover_letter_used": new_cover_letter_used.strip(),
+                "notes": new_notes.strip(),
+            },
+        )
+        st.success("Updated.")
+        st.rerun()
+    except Exception as e:
+        st.error(f"Failed to update: {e}")
 
-# ---- Footer credit ----
-st.markdown(
-    """
-    <style>
-    .footer {
-        position: fixed;
-        bottom: 10px;
-        left: 10px;
-        font-size: 12px;
-        color: #888888;
-        z-index: 100;
-    }
-    </style>
-    <div class="footer">
-        Built by <b>Saif Adnan Khan</b>
-    </div>
-    """,
-    unsafe_allow_html=True
-)
+if delete_edit:
+    try:
+        delete_job(user.id, job_id)
+        st.success("Deleted.")
+        st.rerun()
+    except Exception as e:
+        st.error(f"Failed to delete: {e}")
